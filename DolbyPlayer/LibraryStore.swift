@@ -1,4 +1,6 @@
+import AVFoundation
 import Foundation
+import UIKit
 
 /// 一条媒体记录：本地文件（安全作用域书签）或网络地址（二选一）
 struct MediaItem: Identifiable, Codable, Equatable {
@@ -189,7 +191,7 @@ final class LibraryStore: ObservableObject {
         scanFolderName = nil
     }
 
-    /// 扫描 App 自身的 Documents 目录（通过「文件」App 拷进流光的视频会出现在这里）
+    /// 扫描 App 自身的 Documents 目录（通过「文件」App 拷进 Lumen 的视频会出现在这里）
     @discardableResult
     func scanOwnDocuments() -> Int {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -226,6 +228,17 @@ final class LibraryStore: ObservableObject {
             save()
         }
         return (newItems.count, found)
+    }
+
+    /// 同一部剧的下一集（按文件名识别剧集；没有下一集返回 nil）
+    func nextInSeries(after item: MediaItem) -> MediaItem? {
+        guard let info = EpisodeParser.parse(item.name) else { return nil }
+        let episodes = items
+            .filter { EpisodeParser.parse($0.name)?.show == info.show }
+            .sorted(by: EpisodeParser.episodeSort)
+        guard let index = episodes.firstIndex(where: { $0.id == item.id }),
+              index + 1 < episodes.count else { return nil }
+        return episodes[index + 1]
     }
 
     // MARK: - 解析可播放地址
@@ -304,6 +317,57 @@ final class LibraryStore: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: key),
               let decoded = try? JSONDecoder().decode([MediaItem].self, from: data) else { return }
         items = decoded
+    }
+}
+
+// MARK: - 缩略图（真实视频帧；MKV 用重封装后的缓存 MP4 生成）
+
+enum ThumbnailStore {
+    private static var directory: URL {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let dir = caches.appendingPathComponent("thumbs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    static func cached(for item: MediaItem) -> UIImage? {
+        let url = directory.appendingPathComponent(item.id.uuidString + ".jpg")
+        return UIImage(contentsOfFile: url.path)
+    }
+
+    /// 生成缩略图并落盘缓存；只处理本地文件（直链跳过）
+    @MainActor
+    static func generate(for item: MediaItem, store: LibraryStore) async -> UIImage? {
+        if let image = cached(for: item) { return image }
+        guard item.urlString == nil else { return nil }
+
+        var source: URL?
+        var needsScopeStop = false
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let remuxed = caches.appendingPathComponent(item.name + ".mp4")
+        if FileManager.default.fileExists(atPath: remuxed.path) {
+            source = remuxed // MKV 已重封装过：用缓存 MP4 抽帧（在 App 沙盒里，无需书签）
+        } else if let ext = item.fileExtension, ["mp4", "mov", "m4v"].contains(ext) {
+            source = store.resolveURL(for: item)
+            needsScopeStop = source != nil
+        }
+        guard let src = source else { return nil }
+
+        let image = await Task.detached(priority: .utility) { () -> UIImage? in
+            let asset = AVURLAsset(url: src)
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: 400, height: 600)
+            let time = CMTime(seconds: 30, preferredTimescale: 600)
+            guard let cg = try? generator.copyCGImage(at: time, actualTime: nil) else { return nil }
+            return UIImage(cgImage: cg)
+        }.value
+
+        if needsScopeStop { store.stopAccessing() }
+        if let image, let data = image.jpegData(compressionQuality: 0.75) {
+            try? data.write(to: directory.appendingPathComponent(item.id.uuidString + ".jpg"))
+        }
+        return image
     }
 }
 
