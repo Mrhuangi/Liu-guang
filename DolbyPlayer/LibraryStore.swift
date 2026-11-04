@@ -275,6 +275,8 @@ final class LibraryStore: ObservableObject {
             options: [.skipsHiddenFiles]) else { return (0, 0) }
         var found = 0
         var newItems: [MediaItem] = []
+        var knownKeys = Set(items.map { "\($0.name.lowercased())|\($0.fileExtension ?? "")" })
+        var scanNames = Set<String>()
         for case let fileURL as URL in enumerator {
             let ext = fileURL.pathExtension.lowercased()
             guard Self.videoExtensions.contains(ext) else { continue }
@@ -282,10 +284,12 @@ final class LibraryStore: ObservableObject {
             found += 1
             let name = fileURL.deletingPathExtension().lastPathComponent
             let lower = name.lowercased()
-            let exists = items.contains {
-                $0.name.lowercased() == lower && ($0.fileExtension == nil || $0.fileExtension == ext)
-            } || newItems.contains { $0.name.lowercased() == lower }
+            // 去重走预建索引（Set），避免逐个文件线性扫全库的平方级耗时
+            let exists = knownKeys.contains("\(lower)|\(ext)")
+                || knownKeys.contains("\(lower)|")
+                || scanNames.contains(lower)
             if exists { continue }
+            scanNames.insert(lower)
             let bookmark = try? fileURL.bookmarkData(options: [.minimalBookmark],
                                                       includingResourceValuesForKeys: nil,
                                                       relativeTo: nil)
