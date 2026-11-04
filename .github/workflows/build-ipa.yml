@@ -19,7 +19,7 @@ jobs:
 
       - name: Generate app icon
         run: |
-          pip3 install --quiet pillow
+          pip3 install --break-system-packages --quiet pillow
           python3 tools/make_icons_ci.py
 
       - name: Build (no code signing)
