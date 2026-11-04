@@ -47,6 +47,9 @@ struct PlayerView: UIViewControllerRepresentable {
         if controller.player !== player {
             controller.player = player
         }
+        // 「退出时自动画中画」设置（默认开）
+        let autoPiP = UserDefaults.standard.object(forKey: "settings.autoPiP") as? Bool != false
+        controller.canStartPictureInPictureAutomaticallyFromInline = autoPiP
         let label = context.coordinator.label
         label?.text = subtitleText.isEmpty ? nil : " \(subtitleText) "
         label?.isHidden = subtitleText.isEmpty
