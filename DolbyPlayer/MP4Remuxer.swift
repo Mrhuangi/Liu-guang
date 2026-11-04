@@ -152,6 +152,26 @@ private final class OutputTrack {
 final class RemuxService {
 
     func remux(input: URL, progress: @escaping (Double) -> Void) throws -> RemuxResult {
+        // 重封装缓存：来源文件指纹（路径+大小+修改时间）没变且产物还在 → 直接复用，二次起播免重封装
+        let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let plainOutName = input.deletingPathExtension().lastPathComponent + ".mp4"
+        if let fingerprint = Self.sourceFingerprint(input),
+           let saved = Self.stampIndex()[plainOutName],
+           saved.hasPrefix(fingerprint + "|") {
+            let parts = saved.split(separator: "|", omittingEmptySubsequences: false)
+            let plainOut = cachesDir.appendingPathComponent(plainOutName)
+            if parts.count == 6,
+               ((try? plainOut.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0) > 0 {
+                AppLog.add("播放", "重封装缓存命中，跳过重封装：\(plainOutName)")
+                progress(1.0)
+                return RemuxResult(outputURL: plainOut,
+                                   isDolbyVision: parts[3] == "1",
+                                   dvProfile: Int(parts[4]).flatMap { $0 >= 0 ? $0 : nil },
+                                   durationSeconds: Double(parts[5]) ?? 0,
+                                   warnings: [])
+            }
+        }
+
         let demuxer = try MatroskaDemuxer(url: input)
         defer { demuxer.close() }
         try demuxer.parseHeader()
@@ -387,11 +407,54 @@ final class RemuxService {
         progress(1.0)
 
         let durationMs = activeTracks.map { Self.trackEndMs($0) }.max() ?? 0
+        // 记录缓存指纹，并只保留最近两个重封装产物，避免大文件塞满缓存目录
+        if let fingerprint = Self.sourceFingerprint(input) {
+            var index = Self.stampIndex()
+            index[outURL.lastPathComponent] = "\(fingerprint)|\(isDV ? 1 : 0)|\(dvProfile ?? -1)|\(Double(durationMs) / 1000.0)"
+            Self.pruneRemuxOutputs(in: caches, keeping: outURL, index: &index)
+            UserDefaults.standard.set(index, forKey: Self.stampKey)
+        }
         return RemuxResult(outputURL: outURL,
                            isDolbyVision: isDV,
                            dvProfile: dvProfile,
                            durationSeconds: Double(durationMs) / 1000.0,
                            warnings: warnings)
+    }
+
+    // MARK: 重封装缓存指纹
+
+    private static let stampKey = "remux.cache.v1"
+
+    private static func sourceFingerprint(_ input: URL) -> String? {
+        guard let values = try? input.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              let size = values.fileSize,
+              let mtime = values.contentModificationDate else { return nil }
+        return "\(input.path)|\(size)|\(Int(mtime.timeIntervalSince1970))"
+    }
+
+    private static func stampIndex() -> [String: String] {
+        UserDefaults.standard.dictionary(forKey: stampKey) as? [String: String] ?? [:]
+    }
+
+    private static func pruneRemuxOutputs(in dir: URL, keeping: URL, index: inout [String: String]) {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey]) else { return }
+        var dated: [(url: URL, date: Date)] = []
+        for file in files where file.pathExtension.lowercased() == "mp4" {
+            if let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey]),
+               values.isDirectory != true {
+                dated.append((file, values.contentModificationDate ?? .distantPast))
+            }
+        }
+        dated.sort { $0.date > $1.date }
+        var keptOthers = 0
+        for entry in dated where entry.url != keeping {
+            keptOthers += 1
+            if keptOthers > 1 {
+                try? FileManager.default.removeItem(at: entry.url)
+                index.removeValue(forKey: entry.url.lastPathComponent)
+            }
+        }
     }
 
     // MARK: - DV 扫描
