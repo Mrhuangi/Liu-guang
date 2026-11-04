@@ -111,7 +111,7 @@ final class LibraryStore: ObservableObject {
     func addFile(url: URL) {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        var bookmark = try? url.bookmarkData(options: [.withSecurityScope],
+        var bookmark = try? url.bookmarkData(options: [],
                                              includingResourceValuesForKeys: nil,
                                              relativeTo: nil)
         var finalURL = url
@@ -184,7 +184,7 @@ final class LibraryStore: ObservableObject {
     func addSource(url: URL) -> (added: Int, found: Int) {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        guard let data = try? url.bookmarkData(options: [.withSecurityScope],
+        guard let data = try? url.bookmarkData(options: [],
                                                includingResourceValuesForKeys: nil,
                                                relativeTo: nil) else {
             AppLog.add("扫描", "添加文件夹失败：\(url.lastPathComponent) 书签创建失败")
@@ -438,7 +438,7 @@ final class LibraryStore: ObservableObject {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         items[index].subtitleBookmark = try? url.bookmarkData(
-            options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+            options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
         items[index].subtitleName = url.lastPathComponent
         save()
     }
