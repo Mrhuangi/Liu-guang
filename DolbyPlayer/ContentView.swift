@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var store = LibraryStore()
+    @StateObject private var scrape = ScrapeStore()
     @AppStorage("appearance.mode") private var appearanceRaw = AppearanceMode.system.rawValue
 
     var body: some View {
@@ -25,6 +26,7 @@ struct ContentView: View {
         }
         .tabBarMinimizeBehavior(.onScrollDown)
         .environmentObject(store)
+        .environmentObject(scrape)
         .preferredColorScheme(AppearanceMode(rawValue: appearanceRaw)?.scheme ?? nil)
     }
 }
@@ -124,6 +126,7 @@ enum EpisodeParser {
 
 struct LibraryView: View {
     @EnvironmentObject private var store: LibraryStore
+    @EnvironmentObject private var scrape: ScrapeStore
     @Environment(\.dynamicTypeSize) private var typeSize
     @AppStorage("library.sort") private var sortRaw = LibrarySort.recentPlayed.rawValue
     @AppStorage("library.display") private var displayRaw = LibraryDisplay.grid.rawValue
@@ -172,9 +175,9 @@ struct LibraryView: View {
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
+                        Button { showFolderImporter = true } label: { Label("添加文件夹", systemImage: "folder.badge.plus") }
                         Button { showImporter = true } label: { Label("导入文件", systemImage: "doc.badge.plus") }
-                        Button { showFolderImporter = true } label: { Label("扫描文件夹", systemImage: "folder.badge.plus") }
-                        if store.scanFolderName != nil {
+                        if !store.sources.isEmpty {
                             Button { rescan() } label: { Label("重新扫描", systemImage: "arrow.triangle.2.circlepath") }
                         }
                     } label: {
@@ -213,8 +216,8 @@ struct LibraryView: View {
             switch result {
             case .success(let urls):
                 if let folder = urls.first {
-                    let r = store.setScanFolder(url: folder)
-                    scanSummary = "在「\(folder.lastPathComponent)」里共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。之后每次打开 App 都会自动扫描这个文件夹。"
+                    let r = store.addSource(url: folder)
+                    scanSummary = "已添加文件源「\(folder.lastPathComponent)」：共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。之后每次打开 App 都会自动扫描。"
                 }
             case .failure(let error):
                 AppLog.add("扫描", "文件夹选择器失败：\(error.localizedDescription)")
@@ -238,9 +241,13 @@ struct LibraryView: View {
             Text(scanSummary ?? "")
         }
         .task {
-            // 启动自动扫描：App 自身文档目录 + 已保存的扫描文件夹
+            // 启动自动扫描：App 自身文档目录 + 全部文件源；剧集自动刮削元数据
             store.scanOwnDocuments()
             store.rescanSavedFolder()
+            scrape.ensureAll(items: store.items)
+        }
+        .onChange(of: store.items.count) { _, _ in
+            scrape.ensureAll(items: store.items)
         }
         .fileImporter(isPresented: Binding(
             get: { subtitleTarget != nil },
@@ -399,8 +406,8 @@ struct LibraryView: View {
     }
 
     private func rescan() {
-        if let r = store.rescanSavedFolder(), let name = store.scanFolderName {
-            scanSummary = "重新扫描「\(name)」完成：共 \(r.found) 个视频，新加入 \(r.added) 个。"
+        if let r = store.rescanSavedFolder() {
+            scanSummary = "重新扫描完成：共 \(r.found) 个视频，新加入 \(r.added) 个。"
         }
     }
 
@@ -427,26 +434,27 @@ struct EmptyLibraryView: View {
     let onScan: () -> Void
 
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 14) {
             Image(systemName: "film.stack")
-                .font(.system(size: 44, weight: .light))
+                .font(.system(size: 30, weight: .light))
                 .foregroundStyle(.secondary)
             Text("暂无影片")
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(.primary)
-            Text("导入本地 MKV / MP4 文件，或扫描一个文件夹自动入库。\nMKV 会无损重封装为 MP4 后原生播放杜比视界。")
+            Text("添加一个文件夹作为文件源，视频会自动入库。\nMKV 会无损重封装为 MP4 后原生播放杜比视界。")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
             VStack(spacing: 10) {
-                Button(action: onImport) {
-                    Text("导入文件").frame(maxWidth: 220)
+                Button(action: onScan) {
+                    Text("添加文件夹").frame(maxWidth: 220)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                Button(action: onScan) {
-                    Text("扫描文件夹").frame(maxWidth: 220)
+                Button(action: onImport) {
+                    Text("导入单个文件").frame(maxWidth: 220)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.large)
@@ -594,15 +602,28 @@ struct PosterView: View {
     }
 }
 
-/// 剧集卡（首页「剧集」分区）
+/// 剧集卡（首页「剧集」分区）：优先用刮削到的官方海报
 struct SeriesCard: View {
+    @EnvironmentObject private var scrape: ScrapeStore
     let show: String
     let representative: MediaItem
     let count: Int
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            PosterView(item: representative)
+            if let img = scrape.posterImage(for: show) {
+                Color.clear
+                    .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                    .overlay {
+                        Image(uiImage: img)
+                            .resizable()
+                            .scaledToFill()
+                    }
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            } else {
+                PosterView(item: representative)
+            }
             Text(show)
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.primary)
@@ -615,9 +636,10 @@ struct SeriesCard: View {
     }
 }
 
-/// 剧集详情页：一部剧的全部集数，按季/集排序
+/// 剧集详情页：海报头图 + 简介 + 演职人员 + 带剧照的分集列表（刮削数据来自 TVmaze）
 struct SeriesView: View {
     @EnvironmentObject private var store: LibraryStore
+    @EnvironmentObject private var scrape: ScrapeStore
     let show: String
     @State private var activeItem: MediaItem?
 
@@ -627,19 +649,187 @@ struct SeriesView: View {
             .sorted(by: EpisodeParser.episodeSort)
     }
 
+    private var meta: ShowMeta? { scrape.meta(for: show) }
+
     var body: some View {
-        List(episodes) { item in
-            MediaRow(item: item) { activeItem = item }
-                .contextMenu {
-                    Button { activeItem = item } label: { Label("播放", systemImage: "play.fill") }
-                    Button(role: .destructive) { store.remove(item) } label: { Label("删除", systemImage: "trash") }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                header
+                if let meta, !meta.cast.isEmpty {
+                    castSection(meta)
                 }
+                episodesSection
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 28)
         }
-        .listStyle(.plain)
         .navigationTitle(show)
         .navigationBarTitleDisplayMode(.inline)
         .fullScreenCover(item: $activeItem) { item in
             PlaybackFlow(item: item, store: store)
+        }
+        .task { scrape.ensureAll(items: store.items) }
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 14) {
+            Group {
+                if let img = scrape.posterImage(for: show) {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFill()
+                } else if let first = episodes.first {
+                    PosterView(item: first)
+                }
+            }
+            .frame(width: 104, height: 156)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(meta?.title ?? show)
+                    .font(.title3.weight(.bold))
+                    .fixedSize(horizontal: false, vertical: true)
+                if let meta {
+                    HStack(spacing: 6) {
+                        if let year = meta.year { Text(year) }
+                        if let rating = meta.rating {
+                            Label(String(format: "%.1f", rating), systemImage: "star.fill")
+                        }
+                        if !meta.genres.isEmpty {
+                            Text(meta.genres.prefix(3).joined(separator: " · "))
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    if let summary = meta.summary {
+                        Text(summary)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(6)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    Text("正在匹配剧集信息…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text("共 \(episodes.count) 集")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func castSection(_ meta: ShowMeta) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("演职人员")
+                .font(.headline)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 14) {
+                    ForEach(meta.cast.indices, id: \.self) { index in
+                        let member = meta.cast[index]
+                        VStack(spacing: 5) {
+                            castAvatar(member)
+                            Text(member.name)
+                                .font(.caption2.weight(.medium))
+                                .lineLimit(2)
+                                .multilineTextAlignment(.center)
+                            if let character = member.character {
+                                Text(character)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .frame(width: 64)
+                    }
+                }
+            }
+        }
+    }
+
+    private func castAvatar(_ member: CastMember) -> some View {
+        Group {
+            if let img = ScrapeStore.image(named: member.imageFile) {
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Circle()
+                    .fill(Color.secondary.opacity(0.25))
+                    .overlay {
+                        Image(systemName: "person.fill")
+                            .foregroundStyle(.secondary)
+                    }
+            }
+        }
+        .frame(width: 54, height: 54)
+        .clipShape(Circle())
+    }
+
+    private var episodesSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("分集")
+                .font(.headline)
+                .padding(.bottom, 4)
+            ForEach(episodes) { item in
+                episodeRow(item)
+                Divider()
+            }
+        }
+    }
+
+    private func episodeRow(_ item: MediaItem) -> some View {
+        let info = EpisodeParser.parse(item.name)
+        let em = info.flatMap { meta?.episodes[ScrapeStore.episodeKey(season: $0.season, episode: $0.episode)] }
+        return Button {
+            activeItem = item
+        } label: {
+            HStack(spacing: 12) {
+                Group {
+                    if let info, let img = scrape.stillImage(for: show, season: info.season, episode: info.episode) {
+                        Image(uiImage: img)
+                            .resizable()
+                            .scaledToFill()
+                    } else {
+                        PosterView(item: item, wide: true)
+                    }
+                }
+                .frame(width: 118, height: 66)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                VStack(alignment: .leading, spacing: 3) {
+                    if let info {
+                        Text("第 \(info.episode) 集 · \(ScrapeStore.episodeKey(season: info.season, episode: info.episode))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(em?.title ?? item.name)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                    if let runtime = em?.runtime {
+                        Text("\(runtime) 分钟")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let p = store.progressMap[item.id] {
+                        ProgressBar(value: p)
+                            .frame(maxWidth: 140)
+                    }
+                }
+                Spacer()
+                Image(systemName: "play.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button { activeItem = item } label: { Label("播放", systemImage: "play.fill") }
+            Button(role: .destructive) { store.remove(item) } label: { Label("删除", systemImage: "trash") }
         }
     }
 }
@@ -776,35 +966,41 @@ struct SourcesView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("扫描文件夹") {
-                    LabeledContent("当前文件夹", value: store.scanFolderName ?? "未设置")
+                Section("文件源（文件夹）") {
+                    if store.sources.isEmpty {
+                        Text("还没有添加文件夹。添加后，文件夹里的视频会原地读取、自动入库，不拷贝文件。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(store.sources) { source in
+                        Label(source.name, systemImage: "folder.fill")
+                    }
+                    .onDelete { offsets in
+                        offsets.map { store.sources[$0] }.forEach(store.removeSource)
+                    }
                     Button {
                         showFolderImporter = true
                     } label: {
-                        Label(store.scanFolderName == nil ? "选择文件夹" : "更换文件夹",
-                              systemImage: "folder.badge.plus")
+                        Label("添加文件夹", systemImage: "folder.badge.plus")
                     }
-                    if store.scanFolderName != nil {
+                    if !store.sources.isEmpty {
                         Button {
                             rescan()
                         } label: {
-                            Label("重新扫描", systemImage: "arrow.triangle.2.circlepath")
-                        }
-                        Button("清除扫描文件夹", role: .destructive) {
-                            store.clearScanFolder()
+                            Label("重新扫描全部", systemImage: "arrow.triangle.2.circlepath")
                         }
                     }
-                    Text("选一次文件夹，之后每次打开 App 都会自动把里面的新视频加入媒体库。")
+                    Text("每次打开 App 都会自动扫描文件源里的新视频。左滑可移除文件源（已入库的条目不受影响）。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                Section("导入文件") {
+                Section("导入单个文件") {
                     Button {
                         showImporter = true
                     } label: {
                         Label("从「文件」导入", systemImage: "doc.badge.plus")
                     }
-                    Text("也可以把视频拷进「文件」App 里 Lumen 的文件夹，下次打开 App 时会自动入库。")
+                    Text("单个大文件（几个 GB）经系统选择器导出会很慢，建议用上面的「添加文件夹」加入它所在的文件夹。也可以把视频拷进「文件」App 里 Lumen 的文件夹，下次打开 App 时会自动入库。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -832,8 +1028,8 @@ struct SourcesView: View {
             switch result {
             case .success(let urls):
                 if let folder = urls.first {
-                    let r = store.setScanFolder(url: folder)
-                    summary = "在「\(folder.lastPathComponent)」里共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。"
+                    let r = store.addSource(url: folder)
+                    summary = "已添加文件源「\(folder.lastPathComponent)」：共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。"
                 }
             case .failure(let error):
                 AppLog.add("扫描", "文件夹选择器失败：\(error.localizedDescription)")
@@ -859,9 +1055,8 @@ struct SourcesView: View {
     }
 
     private func rescan() {
-        if let r = store.rescanSavedFolder(), let name = store.scanFolderName {
-            summary = "重新扫描「\(name)」完成：共 \(r.found) 个视频，新加入 \(r.added) 个。"
-        }
+        let r = store.rescanAllSources()
+        summary = "重新扫描完成：共 \(r.found) 个视频，新加入 \(r.added) 个。"
     }
 }
 
@@ -903,19 +1098,18 @@ struct SettingsView: View {
                     }
                 }
                 Section("扫描") {
-                    LabeledContent("扫描文件夹", value: store.scanFolderName ?? "未设置")
-                    if store.scanFolderName != nil {
-                        Button("重新扫描") {
-                            if let r = store.rescanSavedFolder() {
-                                scanNote = "共 \(r.found) 个视频，新加入 \(r.added) 个。"
-                            }
+                    LabeledContent("文件源数量", value: "\(store.sources.count)")
+                    if !store.sources.isEmpty {
+                        Button("重新扫描全部") {
+                            let r = store.rescanAllSources()
+                            scanNote = "共 \(r.found) 个视频，新加入 \(r.added) 个。"
                         }
-                        Button("清除扫描文件夹", role: .destructive) {
+                        Button("清除全部文件源", role: .destructive) {
                             store.clearScanFolder()
                             scanNote = nil
                         }
                     } else {
-                        Text("在媒体库右上角的 ＋ 里选「扫描文件夹」，选一次文件夹，之后每次打开 App 都会自动把里面的新视频加入媒体库。")
+                        Text("在「文件源」页点「添加文件夹」，选一次文件夹，之后每次打开 App 都会自动把里面的新视频加入媒体库。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -940,7 +1134,7 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 Section("关于") {
-                    LabeledContent("版本", value: "4.4")
+                    LabeledContent("版本", value: "5.0")
                     Text("本地重封装引擎：MKV 无损转 MP4（dvh1），杜比视界单层原生输出；文本字幕转内嵌字幕轨，图形字幕（PGS/VobSub）暂跳过。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
