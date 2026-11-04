@@ -1163,7 +1163,7 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 Section("关于") {
-                    LabeledContent("版本", value: "5.3")
+                    LabeledContent("版本", value: "5.4")
                     Text("本地重封装引擎：MKV 无损转 MP4（dvh1），杜比视界单层原生输出；文本字幕转内嵌字幕轨，图形字幕（PGS/VobSub）暂跳过。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
