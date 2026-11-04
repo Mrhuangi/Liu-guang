@@ -50,6 +50,8 @@ struct LibraryView: View {
 
     @State private var activeItem: MediaItem?
     @State private var showImporter = false
+    @State private var showFolderImporter = false
+    @State private var scanSummary: String?
     @State private var showURLAlert = false
     @State private var urlText = ""
     @State private var showSettings = false
@@ -84,6 +86,7 @@ struct LibraryView: View {
                         Text("导入本地 MKV / MP4 文件，或添加网络直链。MKV 会无损重封装为 MP4 后原生播放杜比视界。")
                     } actions: {
                         Button("导入文件") { showImporter = true }
+                        Button("扫描文件夹") { showFolderImporter = true }
                         Button("添加网址") { showURLAlert = true }
                     }
                 } else if effectiveDisplay == .grid {
@@ -97,6 +100,10 @@ struct LibraryView: View {
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
                         Button { showImporter = true } label: { Label("导入文件", systemImage: "doc.badge.plus") }
+                        Button { showFolderImporter = true } label: { Label("扫描文件夹", systemImage: "folder.badge.plus") }
+                        if store.scanFolderName != nil {
+                            Button { rescan() } label: { Label("重新扫描", systemImage: "arrow.triangle.2.circlepath") }
+                        }
                         Button { showURLAlert = true } label: { Label("添加网址", systemImage: "link.badge.plus") }
                     } label: {
                         Image(systemName: "plus")
@@ -123,6 +130,27 @@ struct LibraryView: View {
                       allowedContentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .item],
                       allowsMultipleSelection: true) { result in
             if case .success(let urls) = result { urls.forEach(store.addFile) }
+        }
+        .fileImporter(isPresented: $showFolderImporter,
+                      allowedContentTypes: [.folder],
+                      allowsMultipleSelection: false) { result in
+            if case .success(let urls) = result, let folder = urls.first {
+                let r = store.setScanFolder(url: folder)
+                scanSummary = "在「\(folder.lastPathComponent)」里共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。之后每次打开 App 都会自动扫描这个文件夹。"
+            }
+        }
+        .alert("扫描完成", isPresented: Binding(
+            get: { scanSummary != nil },
+            set: { if !$0 { scanSummary = nil } }
+        )) {
+            Button("好") { scanSummary = nil }
+        } message: {
+            Text(scanSummary ?? "")
+        }
+        .task {
+            // 启动自动扫描：App 自身文档目录 + 已保存的扫描文件夹
+            store.scanOwnDocuments()
+            store.rescanSavedFolder()
         }
         .alert("添加网络直链", isPresented: $showURLAlert) {
             TextField("https://…/movie.mkv", text: $urlText)
@@ -202,6 +230,12 @@ struct LibraryView: View {
             }
         }
         .listStyle(.plain)
+    }
+
+    private func rescan() {
+        if let r = store.rescanSavedFolder(), let name = store.scanFolderName {
+            scanSummary = "重新扫描「\(name)」完成：共 \(r.found) 个视频，新加入 \(r.added) 个。"
+        }
     }
 
     @ViewBuilder
@@ -287,6 +321,7 @@ struct LiuGuangGlyph: View {
 extension MediaItem {
     var isRemote: Bool { urlString != nil }
     var formatText: String {
+        if let e = fileExtension, !e.isEmpty { return e.uppercased() }
         let ext = ((urlString ?? name) as NSString).pathExtension.uppercased()
         return ext.isEmpty ? "视频" : ext
     }
@@ -446,6 +481,7 @@ struct SettingsView: View {
     @AppStorage("settings.autoResume") private var autoResume = true
     @AppStorage("settings.subFontSize") private var subFontSize: Double = 17
     @State private var cacheNote: String?
+    @State private var scanNote: String?
 
     var body: some View {
         NavigationStack {
@@ -454,6 +490,27 @@ struct SettingsView: View {
                     Toggle("自动续播", isOn: $autoResume)
                     Stepper(value: $subFontSize, in: 13...26, step: 1) {
                         LabeledContent("外挂字幕字号", value: "\(Int(subFontSize))")
+                    }
+                }
+                Section("扫描") {
+                    LabeledContent("扫描文件夹", value: store.scanFolderName ?? "未设置")
+                    if store.scanFolderName != nil {
+                        Button("重新扫描") {
+                            if let r = store.rescanSavedFolder() {
+                                scanNote = "共 \(r.found) 个视频，新加入 \(r.added) 个。"
+                            }
+                        }
+                        Button("清除扫描文件夹", role: .destructive) {
+                            store.clearScanFolder()
+                            scanNote = nil
+                        }
+                    } else {
+                        Text("在媒体库右上角的 ＋ 里选「扫描文件夹」，选一次文件夹，之后每次打开 App 都会自动把里面的新视频加入媒体库。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let scanNote {
+                        Text(scanNote).font(.footnote).foregroundStyle(.secondary)
                     }
                 }
                 Section("数据") {
@@ -467,7 +524,7 @@ struct SettingsView: View {
                     }
                 }
                 Section("关于") {
-                    LabeledContent("版本", value: "4.0")
+                    LabeledContent("版本", value: "4.1")
                     Text("本地重封装引擎：MKV 无损转 MP4（dvh1），杜比视界单层原生输出；文本字幕转内嵌字幕轨，图形字幕（PGS/VobSub）暂跳过。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -507,11 +564,6 @@ struct PlaybackFlow: View {
     @State private var failure: String?
     @State private var warnings: [String] = []
     @State private var showWarnings = false
-
-    private var isMKV: Bool {
-        let source = item.urlString ?? item.name
-        return (source as NSString).pathExtension.lowercased() == "mkv"
-    }
 
     var body: some View {
         ZStack {
@@ -583,7 +635,8 @@ struct PlaybackFlow: View {
             failure = "无法读取这个文件（书签失效或链接不可用），请删除后重新导入。"
             return
         }
-        if !isMKV {
+        // 是否 MKV 按解析出的真实文件地址判断（片名不带扩展名，不能只看名字）
+        if url.pathExtension.lowercased() != "mkv" {
             playURL = url
             return
         }
