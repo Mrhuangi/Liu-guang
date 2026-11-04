@@ -264,6 +264,9 @@ struct LibraryView: View {
         } message: {
             Text(scanSummary ?? "")
         }
+        .onOpenURL { url in
+            store.handleIncomingFile(url)
+        }
         .task {
             // 启动自动扫描：App 自身文档目录 + 全部文件源；剧集自动刮削元数据
             store.scanOwnDocuments()
@@ -1003,6 +1006,17 @@ struct SourcesView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("本机目录") {
+                    Text("打开「文件」App →「浏览」→「我的 iPhone」→「Lumen」，把视频或整个文件夹拷进来，回到 Lumen 就会自动出现在媒体库里，不需要在 App 里做任何选择。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Button {
+                        let added = store.scanOwnDocuments()
+                        summary = added > 0 ? "新入库 \(added) 个视频。" : "没有发现新视频。先把视频拷进「文件」App 的 Lumen 文件夹再试。"
+                    } label: {
+                        Label("扫描本机目录", systemImage: "folder.badge.gearshape")
+                    }
+                }
                 Section("文件源（文件夹）") {
                     if store.sources.isEmpty {
                         Text("还没有添加文件夹。添加后，文件夹里的视频会原地读取、自动入库，不拷贝文件。")
@@ -1163,7 +1177,7 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 Section("关于") {
-                    LabeledContent("版本", value: "5.4")
+                    LabeledContent("版本", value: "5.5")
                     Text("本地重封装引擎：MKV 无损转 MP4（dvh1），杜比视界单层原生输出；文本字幕转内嵌字幕轨，图形字幕（PGS/VobSub）暂跳过。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
