@@ -1,0 +1,59 @@
+name: Build unsigned IPA
+
+# 在 GitHub 的 macOS 云主机上把「流光」编译成未签名 IPA，
+# 产物挂到 Release 供下载，再用手机上的签名工具（全能签 / ESign / Feather 等）+ 证书签名安装。
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate app icon
+        run: |
+          pip3 install --quiet pillow
+          python3 tools/make_icons_ci.py
+
+      - name: Build (no code signing)
+        run: |
+          xcodebuild \
+            -project DolbyPlayer.xcodeproj \
+            -scheme DolbyPlayer \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          echo "App bundle: $APP_PATH"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -r Liuguang-unsigned.ipa Payload
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Liuguang-unsigned-ipa
+          path: Liuguang-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Publish IPA to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: 流光未签名 IPA · build-${{ github.run_number }}
+          files: Liuguang-unsigned.ipa
+          fail_on_unmatched_files: true
