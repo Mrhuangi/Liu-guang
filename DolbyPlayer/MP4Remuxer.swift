@@ -201,6 +201,19 @@ final class RemuxService {
         for track in demuxer.tracks where track.type == 17 {
             if track.isTextSubtitle {
                 let ot = OutputTrack(source: track, isVideo: false, isSubtitle: true)
+                // 语言缺失时按轨道名兜底（如「简体中文」「CHS」），让播放器认得出中文字幕、能默认选中
+                if ot.source.language.isEmpty {
+                    let n = ot.source.name
+                    let upper = n.uppercased()
+                    if n.contains("简") || n.contains("繁") || n.contains("中文")
+                        || upper.contains("CHS") || upper.contains("CHT") || upper.contains("CHI") {
+                        ot.source.language = "chi"
+                    } else if upper.contains("ENG") || n.contains("英文") {
+                        ot.source.language = "eng"
+                    } else if n.contains("日") || upper.contains("JPN") {
+                        ot.source.language = "jpn"
+                    }
+                }
                 outputTracks.append(ot)
                 subtitleByNumber[track.number] = ot
             } else if track.isImageSubtitle {
