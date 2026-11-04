@@ -595,7 +595,7 @@ struct PlaybackFlow: View {
             }
             remuxProgress = nil
             warnings = result.warnings
-            playURL = result.url
+            playURL = result.outputURL
             if !warnings.isEmpty { showWarnings = true }
         } catch let error as RemuxError {
             failure = error.errorDescription ?? "重封装失败。"
@@ -611,7 +611,7 @@ final class RemuxRunner {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let result = try MP4Remuxer().remux(input: input, progress: progress)
+                    let result = try RemuxService().remux(input: input, progress: progress)
                     continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)
