@@ -67,6 +67,16 @@ final class LibraryStore: ObservableObject {
         load()
         refreshProgress()
         loadSources()
+        ensureLocalFolderPlaceholder()
+    }
+
+    /// 首次启动时在本机目录放一个说明文件，确保「文件」App 里能看到 Lumen 文件夹
+    private func ensureLocalFolderPlaceholder() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let marker = docs.appendingPathComponent("把视频放进这个文件夹.txt")
+        if !FileManager.default.fileExists(atPath: marker.path) {
+            try? "把电影、剧集的视频文件或整个文件夹拷进这里，回到 Lumen 就会自动出现在媒体库中。".write(to: marker, atomically: true, encoding: .utf8)
+        }
     }
 
     // MARK: - 续播进度
