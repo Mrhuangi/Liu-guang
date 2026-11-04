@@ -268,6 +268,31 @@ final class LibraryStore: ObservableObject {
         return scanFolderContents(docs).added
     }
 
+    /// 处理从其他 App 分享/「打开方式」送进来的视频文件：拷入本机目录后自动入库
+    func handleIncomingFile(_ url: URL) {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        if url.standardizedFileURL.path.hasPrefix(docs.standardizedFileURL.path) {
+            _ = scanOwnDocuments()
+            return
+        }
+        var target = docs.appendingPathComponent(url.lastPathComponent)
+        var counter = 1
+        while FileManager.default.fileExists(atPath: target.path) {
+            let base = url.deletingPathExtension().lastPathComponent
+            target = docs.appendingPathComponent("\(base) \(counter).\(url.pathExtension)")
+            counter += 1
+        }
+        do {
+            try FileManager.default.copyItem(at: url, to: target)
+            AppLog.add("导入", "外部打开的视频已存入本机目录：\(target.lastPathComponent)")
+        } catch {
+            AppLog.add("导入", "外部打开的视频保存失败：\(error.localizedDescription)")
+        }
+        _ = scanOwnDocuments()
+    }
+
     /// 递归扫描文件夹，把新视频加入媒体库（按片名＋扩展名去重，已在库的不重复添加）
     private func scanFolderContents(_ folder: URL) -> (added: Int, found: Int) {
         guard let enumerator = FileManager.default.enumerator(
