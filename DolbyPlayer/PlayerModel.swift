@@ -83,9 +83,20 @@ final class PlayerModel: ObservableObject {
                     self.detectFormat(asset: asset)
                     self.detectOrientation(asset: asset)
                     self.resumeIfNeeded(item: item)
-                    if !self.externalCues.isEmpty,
-                       let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) {
-                        item.select(nil, in: group) // 有外挂字幕时不叠内封字幕
+                    if let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) {
+                        if !self.externalCues.isEmpty {
+                            item.select(nil, in: group) // 有外挂字幕时不叠内封字幕
+                        } else if let zh = group.options.first(where: { option in
+                            let tag = (option.extendedLanguageTag ?? "").lowercased()
+                            return tag.hasPrefix("zh") || tag.hasPrefix("cmn") || tag.hasPrefix("yue")
+                                || tag == "chi" || tag == "zho"
+                                || option.displayName.contains("中文")
+                                || option.displayName.contains("Chinese")
+                        }) {
+                            // 有内封中文字幕就默认选上；用户可在系统播放菜单里换轨或关闭
+                            item.select(zh, in: group)
+                            AppLog.add("播放", "已默认选中内封字幕：\(zh.displayName)")
+                        }
                     }
                     self.player.play()
                     // 沿用上次的播放速度（设置里可关）
