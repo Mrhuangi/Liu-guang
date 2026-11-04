@@ -2,6 +2,59 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+
+// MARK: - UIKit 文件选择桥（替代 SwiftUI .fileImporter）
+// 侧载安装环境下 SwiftUI .fileImporter 的选择器会吞掉点击、回调永不触发
+// （GitHub 上有同类开源项目踩过同一个坑并这样修好）。改为从最顶层控制器
+// 直接呈现 UIDocumentPickerViewController，绕开 SwiftUI 的呈现协调层。
+enum DocumentPickerBridge {
+    private static var activeCoordinator: Coordinator?
+
+    static func presentPicker(contentTypes: [UTType], allowsMultiple: Bool,
+                              completion: @escaping ([URL]?) -> Void) {
+        // 稍等一拍，让触发它的菜单先完成关闭动画，避免呈现上下文被拆掉
+        DispatchQueue.main.async {
+            guard let presenter = topPresenter() else {
+                AppLog.add("选择器", "打不开：找不到可呈现的界面")
+                completion(nil)
+                return
+            }
+            let coordinator = Coordinator(completion: completion)
+            activeCoordinator = coordinator
+            let picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: false)
+            picker.allowsMultipleSelection = allowsMultiple
+            picker.delegate = coordinator
+            AppLog.add("选择器", "已打开选择器（多选：\(allowsMultiple)）")
+            presenter.present(picker, animated: true)
+        }
+    }
+
+    private static func topPresenter() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let windows = scenes.flatMap { $0.windows }
+        var top = (windows.first { $0.isKeyWindow } ?? windows.first)?.rootViewController
+        while let presented = top?.presentedViewController { top = presented }
+        return top
+    }
+
+    private final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        private let completion: ([URL]?) -> Void
+        init(completion: @escaping ([URL]?) -> Void) { self.completion = completion }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            AppLog.add("选择器", "已选择 \(urls.count) 项")
+            completion(urls)
+            DocumentPickerBridge.activeCoordinator = nil
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            AppLog.add("选择器", "用户取消选择")
+            completion(nil)
+            DocumentPickerBridge.activeCoordinator = nil
+        }
+    }
+}
+
 // MARK: - 根视图：媒体库 + 搜索（iOS 26 Liquid Glass 基线）
 
 struct ContentView: View {
@@ -132,11 +185,8 @@ struct LibraryView: View {
     @AppStorage("library.display") private var displayRaw = LibraryDisplay.grid.rawValue
 
     @State private var activeItem: MediaItem?
-    @State private var showImporter = false
-    @State private var showFolderImporter = false
     @State private var scanSummary: String?
     @State private var importError: String?
-    @State private var subtitleTarget: MediaItem?
 
     private var sort: LibrarySort { LibrarySort(rawValue: sortRaw) ?? .recentPlayed }
     private var display: LibraryDisplay { LibraryDisplay(rawValue: displayRaw) ?? .grid }
@@ -162,8 +212,8 @@ struct LibraryView: View {
             Group {
                 if store.items.isEmpty {
                     EmptyLibraryView(
-                        onImport: { showImporter = true },
-                        onScan: { showFolderImporter = true }
+                        onImport: { pickFiles() },
+                        onScan: { pickFolder() }
                     )
                 } else if effectiveDisplay == .grid {
                     homeBody
@@ -175,8 +225,8 @@ struct LibraryView: View {
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
-                        Button { showFolderImporter = true } label: { Label("添加文件夹", systemImage: "folder.badge.plus") }
-                        Button { showImporter = true } label: { Label("导入文件", systemImage: "doc.badge.plus") }
+                        Button { pickFolder() } label: { Label("添加文件夹", systemImage: "folder.badge.plus") }
+                        Button { pickFiles() } label: { Label("导入文件", systemImage: "doc.badge.plus") }
                         if !store.sources.isEmpty {
                             Button { rescan() } label: { Label("重新扫描", systemImage: "arrow.triangle.2.circlepath") }
                         }
@@ -196,32 +246,6 @@ struct LibraryView: View {
                         Image(systemName: "ellipsis.circle")
                     }
                 }
-            }
-        }
-        .fileImporter(isPresented: $showImporter,
-                      allowedContentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .item],
-                      allowsMultipleSelection: true) { result in
-            switch result {
-            case .success(let urls):
-                AppLog.add("导入", "文件选择器返回 \(urls.count) 个文件")
-                urls.forEach(store.addFile)
-            case .failure(let error):
-                AppLog.add("导入", "文件选择器失败：\(error.localizedDescription)")
-                importError = error.localizedDescription
-            }
-        }
-        .fileImporter(isPresented: $showFolderImporter,
-                      allowedContentTypes: [.folder],
-                      allowsMultipleSelection: false) { result in
-            switch result {
-            case .success(let urls):
-                if let folder = urls.first {
-                    let r = store.addSource(url: folder)
-                    scanSummary = "已添加文件源「\(folder.lastPathComponent)」：共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。之后每次打开 App 都会自动扫描。"
-                }
-            case .failure(let error):
-                AppLog.add("扫描", "文件夹选择器失败：\(error.localizedDescription)")
-                importError = error.localizedDescription
             }
         }
         .alert("操作失败", isPresented: Binding(
@@ -249,17 +273,32 @@ struct LibraryView: View {
         .onChange(of: store.items.count) { _, _ in
             scrape.ensureAll(items: store.items)
         }
-        .fileImporter(isPresented: Binding(
-            get: { subtitleTarget != nil },
-            set: { if !$0 { subtitleTarget = nil } }
-        ), allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
-            if case .success(let urls) = result, let url = urls.first, let target = subtitleTarget {
-                store.attachSubtitle(item: target, url: url)
-            }
-            subtitleTarget = nil
-        }
         .fullScreenCover(item: $activeItem) { item in
             PlaybackFlow(item: item, store: store)
+        }
+    }
+
+    private func pickFiles() {
+        DocumentPickerBridge.presentPicker(
+            contentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .item],
+            allowsMultiple: true) { urls in
+            guard let urls, !urls.isEmpty else { return }
+            AppLog.add("导入", "选择器返回 \(urls.count) 个文件")
+            urls.forEach(store.addFile)
+        }
+    }
+
+    private func pickFolder() {
+        DocumentPickerBridge.presentPicker(contentTypes: [.folder], allowsMultiple: false) { urls in
+            guard let folder = urls?.first else { return }
+            let r = store.addSource(url: folder)
+            scanSummary = "已添加文件源「\(folder.lastPathComponent)」：共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。之后每次打开 App 都会自动扫描。"
+        }
+    }
+
+    private func pickSubtitle(for item: MediaItem) {
+        DocumentPickerBridge.presentPicker(contentTypes: [.item], allowsMultiple: false) { urls in
+            if let url = urls?.first { store.attachSubtitle(item: item, url: url) }
         }
     }
 
@@ -415,9 +454,9 @@ struct LibraryView: View {
     private func mediaMenu(_ item: MediaItem) -> some View {
         Button { activeItem = item } label: { Label("播放", systemImage: "play.fill") }
         if item.subtitleName == nil {
-            Button { subtitleTarget = item } label: { Label("添加外挂字幕", systemImage: "captions.bubble") }
+            Button { pickSubtitle(for: item) } label: { Label("添加外挂字幕", systemImage: "captions.bubble") }
         } else {
-            Button { subtitleTarget = item } label: { Label("更换外挂字幕", systemImage: "captions.bubble") }
+            Button { pickSubtitle(for: item) } label: { Label("更换外挂字幕", systemImage: "captions.bubble") }
             Button(role: .destructive) { store.detachSubtitle(item: item) } label: {
                 Label("移除外挂字幕", systemImage: "captions.bubble.slash")
             }
@@ -958,8 +997,6 @@ struct SearchView: View {
 
 struct SourcesView: View {
     @EnvironmentObject private var store: LibraryStore
-    @State private var showImporter = false
-    @State private var showFolderImporter = false
     @State private var summary: String?
     @State private var importError: String?
 
@@ -979,7 +1016,7 @@ struct SourcesView: View {
                         offsets.map { store.sources[$0] }.forEach(store.removeSource)
                     }
                     Button {
-                        showFolderImporter = true
+                        pickFolder()
                     } label: {
                         Label("添加文件夹", systemImage: "folder.badge.plus")
                     }
@@ -996,7 +1033,7 @@ struct SourcesView: View {
                 }
                 Section("导入单个文件") {
                     Button {
-                        showImporter = true
+                        pickFiles()
                     } label: {
                         Label("从「文件」导入", systemImage: "doc.badge.plus")
                     }
@@ -1009,32 +1046,6 @@ struct SourcesView: View {
                 }
             }
             .navigationTitle("文件源")
-        }
-        .fileImporter(isPresented: $showImporter,
-                      allowedContentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .item],
-                      allowsMultipleSelection: true) { result in
-            switch result {
-            case .success(let urls):
-                AppLog.add("导入", "文件选择器返回 \(urls.count) 个文件")
-                urls.forEach(store.addFile)
-            case .failure(let error):
-                AppLog.add("导入", "文件选择器失败：\(error.localizedDescription)")
-                importError = error.localizedDescription
-            }
-        }
-        .fileImporter(isPresented: $showFolderImporter,
-                      allowedContentTypes: [.folder],
-                      allowsMultipleSelection: false) { result in
-            switch result {
-            case .success(let urls):
-                if let folder = urls.first {
-                    let r = store.addSource(url: folder)
-                    summary = "已添加文件源「\(folder.lastPathComponent)」：共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。"
-                }
-            case .failure(let error):
-                AppLog.add("扫描", "文件夹选择器失败：\(error.localizedDescription)")
-                importError = error.localizedDescription
-            }
         }
         .alert("扫描完成", isPresented: Binding(
             get: { summary != nil },
@@ -1051,6 +1062,24 @@ struct SourcesView: View {
             Button("好") { importError = nil }
         } message: {
             Text(importError ?? "")
+        }
+    }
+
+    private func pickFiles() {
+        DocumentPickerBridge.presentPicker(
+            contentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .item],
+            allowsMultiple: true) { urls in
+            guard let urls, !urls.isEmpty else { return }
+            AppLog.add("导入", "选择器返回 \(urls.count) 个文件")
+            urls.forEach(store.addFile)
+        }
+    }
+
+    private func pickFolder() {
+        DocumentPickerBridge.presentPicker(contentTypes: [.folder], allowsMultiple: false) { urls in
+            guard let folder = urls?.first else { return }
+            let r = store.addSource(url: folder)
+            summary = "已添加文件源「\(folder.lastPathComponent)」：共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。"
         }
     }
 
@@ -1134,7 +1163,7 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 Section("关于") {
-                    LabeledContent("版本", value: "5.1")
+                    LabeledContent("版本", value: "5.2")
                     Text("本地重封装引擎：MKV 无损转 MP4（dvh1），杜比视界单层原生输出；文本字幕转内嵌字幕轨，图形字幕（PGS/VobSub）暂跳过。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
