@@ -13,6 +13,8 @@ struct MediaItem: Identifiable, Codable, Equatable {
     var subtitleName: String?    // 外挂字幕文件名
     var lastPlayedAt: Date?      // 最近播放时间（v4 新增，用于「继续观看」与排序）
     var fileExtension: String?   // 原始文件扩展名（小写，v4.1 新增：判断 MKV 不能只看片名，旧数据无此键为 nil）
+    var sourceBookmark: Data?    // 文件源文件夹的 security-scoped 书签（v1.0.2 新增，与 relativePath 搭配定位文件）
+    var relativePath: String?    // 文件相对路径（v1.0.2 新增）：有 sourceBookmark 时相对文件源根目录，无时相对 App 文档目录
 }
 
 /// 错误日志：记录导入、扫描、播放各环节的成败，设置页可查看与复制（排查问题用）
@@ -109,10 +111,11 @@ final class LibraryStore: ObservableObject {
     func addFile(url: URL) {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        var bookmark = try? url.bookmarkData(options: [.minimalBookmark],
+        var bookmark = try? url.bookmarkData(options: [.withSecurityScope],
                                              includingResourceValuesForKeys: nil,
                                              relativeTo: nil)
         var finalURL = url
+        var copiedRelativePath: String? = nil
         if bookmark == nil {
             // 大文件绝不走全量拷贝兜底（几个 GB 同步复制会长时间假死）：跳过并提示改用添加文件夹
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
@@ -123,14 +126,14 @@ final class LibraryStore: ObservableObject {
             AppLog.add("导入", "\(url.lastPathComponent)：书签创建失败，尝试拷贝进 App 文档目录")
             if let copied = copyIntoDocuments(url) {
                 finalURL = copied
-                bookmark = try? copied.bookmarkData(options: [.minimalBookmark],
-                                                     includingResourceValuesForKeys: nil,
-                                                     relativeTo: nil)
+                bookmark = nil
+                copiedRelativePath = copied.lastPathComponent
             }
         }
         var item = MediaItem(name: finalURL.deletingPathExtension().lastPathComponent,
                              bookmark: bookmark,
                              urlString: nil)
+        item.relativePath = copiedRelativePath
         item.fileExtension = finalURL.pathExtension.lowercased()
         items.insert(item, at: 0)
         save()
@@ -181,18 +184,20 @@ final class LibraryStore: ObservableObject {
     func addSource(url: URL) -> (added: Int, found: Int) {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        guard let data = try? url.bookmarkData(options: [.minimalBookmark],
+        guard let data = try? url.bookmarkData(options: [.withSecurityScope],
                                                includingResourceValuesForKeys: nil,
                                                relativeTo: nil) else {
             AppLog.add("扫描", "添加文件夹失败：\(url.lastPathComponent) 书签创建失败")
             return (0, 0)
         }
-        if !sources.contains(where: { $0.name == url.lastPathComponent }) {
+        if let existing = sources.firstIndex(where: { $0.name == url.lastPathComponent }) {
+            sources[existing].bookmark = data   // 重新添加同名文件夹：刷新书签，顺带修复失效的旧书签
+        } else {
             sources.append(SourceFolder(name: url.lastPathComponent, bookmark: data))
-            persistSources()
-            syncFolderName()
         }
-        let result = scanFolderContents(url)
+        persistSources()
+        syncFolderName()
+        let result = scanFolderContents(url, folderBookmark: data)
         AppLog.add("扫描", "文件源 \(url.lastPathComponent)：找到 \(result.found) 个视频，新加入 \(result.added) 个")
         return result
     }
@@ -208,9 +213,12 @@ final class LibraryStore: ObservableObject {
         for source in sources {
             var stale = false
             guard let url = try? URL(resolvingBookmarkData: source.bookmark, options: [],
-                                     relativeTo: nil, bookmarkDataIsStale: &stale) else { continue }
+                                     relativeTo: nil, bookmarkDataIsStale: &stale) else {
+                AppLog.add("扫描", "文件源 \(source.name) 的书签已失效，请在文件源页重新添加该文件夹")
+                continue
+            }
             let scoped = url.startAccessingSecurityScopedResource()
-            let r = scanFolderContents(url)
+            let r = scanFolderContents(url, folderBookmark: source.bookmark)
             if scoped { url.stopAccessingSecurityScopedResource() }
             total.added += r.added
             total.found += r.found
@@ -275,7 +283,7 @@ final class LibraryStore: ObservableObject {
     @discardableResult
     func scanOwnDocuments() -> Int {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return scanFolderContents(docs).added
+        return scanFolderContents(docs, folderBookmark: nil).added
     }
 
     /// 处理从其他 App 分享/「打开方式」送进来的视频文件：拷入本机目录后自动入库
@@ -304,13 +312,25 @@ final class LibraryStore: ObservableObject {
     }
 
     /// 递归扫描文件夹，把新视频加入媒体库（按片名＋扩展名去重，已在库的不重复添加）
-    private func scanFolderContents(_ folder: URL) -> (added: Int, found: Int) {
+    /// v1.0.2：条目改存「文件夹书签＋相对路径」定位（逐文件 minimalBookmark 在 iOS 27 上解析失败）；
+    /// 扫描命中老条目时顺带修复其定位，旧版导入的坏条目重新扫描后自愈。
+    private func scanFolderContents(_ folder: URL, folderBookmark: Data?) -> (added: Int, found: Int) {
         guard let enumerator = FileManager.default.enumerator(
             at: folder, includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]) else { return (0, 0) }
+        // 相对路径的基准：文件源以其根目录为准，本机目录一律以文档目录为准
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let basePath = (folderBookmark == nil ? docs : folder).path
         var found = 0
         var newItems: [MediaItem] = []
-        var knownKeys = Set(items.map { "\($0.name.lowercased())|\($0.fileExtension ?? "")" })
+        var repaired = 0
+        var indexByKey: [String: Int] = [:]
+        for (i, item) in items.enumerated() {
+            indexByKey["\(item.name.lowercased())|\(item.fileExtension ?? "")"] = i
+            if indexByKey["\(item.name.lowercased())|"] == nil {
+                indexByKey["\(item.name.lowercased())|"] = i
+            }
+        }
         var scanNames = Set<String>()
         for case let fileURL as URL in enumerator {
             let ext = fileURL.pathExtension.lowercased()
@@ -319,22 +339,34 @@ final class LibraryStore: ObservableObject {
             found += 1
             let name = fileURL.deletingPathExtension().lastPathComponent
             let lower = name.lowercased()
-            // 去重走预建索引（Set），避免逐个文件线性扫全库的平方级耗时
-            let exists = knownKeys.contains("\(lower)|\(ext)")
-                || knownKeys.contains("\(lower)|")
-                || scanNames.contains(lower)
-            if exists { continue }
+            let rel = fileURL.path.hasPrefix(basePath + "/")
+                ? String(fileURL.path.dropFirst(basePath.count + 1))
+                : fileURL.lastPathComponent
+            if let idx = indexByKey["\(lower)|\(ext)"] ?? indexByKey["\(lower)|"] {
+                // 已在库：修复/刷新定位（id 不变，续播与刮削关联都保留）
+                if items[idx].sourceBookmark != folderBookmark || items[idx].relativePath != rel {
+                    items[idx].sourceBookmark = folderBookmark
+                    items[idx].relativePath = rel
+                    repaired += 1
+                }
+                continue
+            }
+            if scanNames.contains(lower) { continue }
             scanNames.insert(lower)
-            let bookmark = try? fileURL.bookmarkData(options: [.minimalBookmark],
-                                                      includingResourceValuesForKeys: nil,
-                                                      relativeTo: nil)
-            var item = MediaItem(name: name, bookmark: bookmark, urlString: nil)
+            var item = MediaItem(name: name, bookmark: nil, urlString: nil)
+            item.sourceBookmark = folderBookmark
+            item.relativePath = rel
             item.fileExtension = ext
             newItems.append(item)
         }
         if !newItems.isEmpty {
             items.insert(contentsOf: newItems, at: 0)
+        }
+        if !newItems.isEmpty || repaired > 0 {
             save()
+        }
+        if repaired > 0 {
+            AppLog.add("扫描", "已修复 \(repaired) 个条目的文件定位")
         }
         return (newItems.count, found)
     }
@@ -356,6 +388,24 @@ final class LibraryStore: ObservableObject {
     func resolveURL(for item: MediaItem) -> URL? {
         stopAccessing()
         if let s = item.urlString { return URL(string: s) }
+        // v1.0.2：相对路径定位——文件源文件走「文件夹书签＋相对路径」，本机目录文件直接拼文档目录
+        if let rel = item.relativePath {
+            if let folderData = item.sourceBookmark {
+                var folderStale = false
+                guard let folderURL = try? URL(resolvingBookmarkData: folderData,
+                                               options: [], relativeTo: nil,
+                                               bookmarkDataIsStale: &folderStale) else {
+                    AppLog.add("播放", "\(item.name)：文件源书签解析失败")
+                    return nil
+                }
+                if folderURL.startAccessingSecurityScopedResource() {
+                    accessingURL = folderURL
+                }
+                return folderURL.appendingPathComponent(rel)
+            }
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            return docs.appendingPathComponent(rel)
+        }
         guard let data = item.bookmark else {
             AppLog.add("播放", "\(item.name)：条目没有书签，无法解析文件")
             return nil
@@ -388,7 +438,7 @@ final class LibraryStore: ObservableObject {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         items[index].subtitleBookmark = try? url.bookmarkData(
-            options: [.minimalBookmark], includingResourceValuesForKeys: nil, relativeTo: nil)
+            options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
         items[index].subtitleName = url.lastPathComponent
         save()
     }
