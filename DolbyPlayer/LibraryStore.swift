@@ -13,6 +13,29 @@ struct MediaItem: Identifiable, Codable, Equatable {
     var fileExtension: String?   // 原始文件扩展名（小写，v4.1 新增：判断 MKV 不能只看片名，旧数据无此键为 nil）
 }
 
+/// 错误日志：记录导入、扫描、播放各环节的成败，设置页可查看与复制（排查问题用）
+enum AppLog {
+    private static let key = "app.log.v1"
+    private static let maxEntries = 300
+
+    static func add(_ tag: String, _ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM-dd HH:mm:ss"
+        var lines = all()
+        lines.append("\(formatter.string(from: Date())) [\(tag)] \(message)")
+        if lines.count > maxEntries { lines.removeFirst(lines.count - maxEntries) }
+        UserDefaults.standard.set(lines, forKey: key)
+    }
+
+    static func all() -> [String] {
+        UserDefaults.standard.stringArray(forKey: key) ?? []
+    }
+
+    static func clear() {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+}
+
 /// 媒体库：增删、持久化（UserDefaults）、书签解析
 @MainActor
 final class LibraryStore: ObservableObject {
@@ -65,16 +88,41 @@ final class LibraryStore: ObservableObject {
     func addFile(url: URL) {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        var bookmark: Data?
-        bookmark = try? url.bookmarkData(options: [.minimalBookmark],
-                                         includingResourceValuesForKeys: nil,
-                                         relativeTo: nil)
-        var item = MediaItem(name: url.deletingPathExtension().lastPathComponent,
+        var bookmark = try? url.bookmarkData(options: [.minimalBookmark],
+                                             includingResourceValuesForKeys: nil,
+                                             relativeTo: nil)
+        var finalURL = url
+        if bookmark == nil {
+            AppLog.add("导入", "\(url.lastPathComponent)：书签创建失败，尝试拷贝进 App 文档目录")
+            if let copied = copyIntoDocuments(url) {
+                finalURL = copied
+                bookmark = try? copied.bookmarkData(options: [.minimalBookmark],
+                                                     includingResourceValuesForKeys: nil,
+                                                     relativeTo: nil)
+            }
+        }
+        var item = MediaItem(name: finalURL.deletingPathExtension().lastPathComponent,
                              bookmark: bookmark,
                              urlString: nil)
-        item.fileExtension = url.pathExtension.lowercased()
+        item.fileExtension = finalURL.pathExtension.lowercased()
         items.insert(item, at: 0)
         save()
+        AppLog.add("导入", "已加入媒体库：\(item.name)（书签\(bookmark == nil ? "无" : "有")）")
+    }
+
+    /// 书签建不起来时的兜底：把文件拷进 App 自己的 Documents 目录
+    private func copyIntoDocuments(_ url: URL) -> URL? {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dest = docs.appendingPathComponent(url.lastPathComponent)
+        if FileManager.default.fileExists(atPath: dest.path) { return dest }
+        do {
+            try FileManager.default.copyItem(at: url, to: dest)
+            AppLog.add("导入", "\(url.lastPathComponent)：已拷贝到 App 文档目录")
+            return dest
+        } catch {
+            AppLog.add("导入", "\(url.lastPathComponent)：拷贝失败 \(error.localizedDescription)")
+            return nil
+        }
     }
 
     func addURL(_ string: String) {
@@ -113,7 +161,9 @@ final class LibraryStore: ObservableObject {
         }
         scanFolderName = url.lastPathComponent
         UserDefaults.standard.set(scanFolderName, forKey: folderNameKey)
-        return scanFolderContents(url)
+        let result = scanFolderContents(url)
+        AppLog.add("扫描", "文件夹 \(url.lastPathComponent)：找到 \(result.found) 个视频，新加入 \(result.added) 个")
+        return result
     }
 
     /// 重新扫描已保存的文件夹（App 启动时自动调用）；没设置过返回 nil
@@ -126,7 +176,11 @@ final class LibraryStore: ObservableObject {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         scanFolderName = url.lastPathComponent
-        return scanFolderContents(url)
+        let result = scanFolderContents(url)
+        if result.added > 0 {
+            AppLog.add("扫描", "自动重扫 \(url.lastPathComponent)：新加入 \(result.added) 个")
+        }
+        return result
     }
 
     func clearScanFolder() {
@@ -180,12 +234,18 @@ final class LibraryStore: ObservableObject {
     func resolveURL(for item: MediaItem) -> URL? {
         stopAccessing()
         if let s = item.urlString { return URL(string: s) }
-        guard let data = item.bookmark else { return nil }
+        guard let data = item.bookmark else {
+            AppLog.add("播放", "\(item.name)：条目没有书签，无法解析文件")
+            return nil
+        }
         var stale = false
         guard let url = try? URL(resolvingBookmarkData: data,
                                  options: [],
                                  relativeTo: nil,
-                                 bookmarkDataIsStale: &stale) else { return nil }
+                                 bookmarkDataIsStale: &stale) else {
+            AppLog.add("播放", "\(item.name)：书签解析失败")
+            return nil
+        }
         if url.startAccessingSecurityScopedResource() {
             accessingURL = url
         }

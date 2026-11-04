@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var store = LibraryStore()
+    @AppStorage("appearance.mode") private var appearanceRaw = AppearanceMode.system.rawValue
 
     var body: some View {
         TabView {
@@ -18,7 +19,27 @@ struct ContentView: View {
         }
         .tabBarMinimizeBehavior(.onScrollDown)
         .environmentObject(store)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(AppearanceMode(rawValue: appearanceRaw)?.scheme ?? nil)
+    }
+}
+
+// MARK: - 外观（跟随系统 / 浅色 / 深色）
+
+enum AppearanceMode: String, CaseIterable {
+    case system, light, dark
+    var label: String {
+        switch self {
+        case .system: return "跟随系统"
+        case .light: return "浅色"
+        case .dark: return "深色"
+        }
+    }
+    var scheme: ColorScheme? {
+        switch self {
+        case .system: return nil
+        case .light: return .light
+        case .dark: return .dark
+        }
     }
 }
 
@@ -52,6 +73,7 @@ struct LibraryView: View {
     @State private var showImporter = false
     @State private var showFolderImporter = false
     @State private var scanSummary: String?
+    @State private var importError: String?
     @State private var showURLAlert = false
     @State private var urlText = ""
     @State private var showSettings = false
@@ -80,15 +102,11 @@ struct LibraryView: View {
         NavigationStack {
             Group {
                 if store.items.isEmpty {
-                    ContentUnavailableView {
-                        Label("暂无影片", systemImage: "film.stack")
-                    } description: {
-                        Text("导入本地 MKV / MP4 文件，或添加网络直链。MKV 会无损重封装为 MP4 后原生播放杜比视界。")
-                    } actions: {
-                        Button("导入文件") { showImporter = true }
-                        Button("扫描文件夹") { showFolderImporter = true }
-                        Button("添加网址") { showURLAlert = true }
-                    }
+                    EmptyLibraryView(
+                        onImport: { showImporter = true },
+                        onScan: { showFolderImporter = true },
+                        onURL: { showURLAlert = true }
+                    )
                 } else if effectiveDisplay == .grid {
                     gridBody
                 } else {
@@ -129,15 +147,36 @@ struct LibraryView: View {
         .fileImporter(isPresented: $showImporter,
                       allowedContentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .item],
                       allowsMultipleSelection: true) { result in
-            if case .success(let urls) = result { urls.forEach(store.addFile) }
+            switch result {
+            case .success(let urls):
+                AppLog.add("导入", "文件选择器返回 \(urls.count) 个文件")
+                urls.forEach(store.addFile)
+            case .failure(let error):
+                AppLog.add("导入", "文件选择器失败：\(error.localizedDescription)")
+                importError = error.localizedDescription
+            }
         }
         .fileImporter(isPresented: $showFolderImporter,
                       allowedContentTypes: [.folder],
                       allowsMultipleSelection: false) { result in
-            if case .success(let urls) = result, let folder = urls.first {
-                let r = store.setScanFolder(url: folder)
-                scanSummary = "在「\(folder.lastPathComponent)」里共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。之后每次打开 App 都会自动扫描这个文件夹。"
+            switch result {
+            case .success(let urls):
+                if let folder = urls.first {
+                    let r = store.setScanFolder(url: folder)
+                    scanSummary = "在「\(folder.lastPathComponent)」里共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。之后每次打开 App 都会自动扫描这个文件夹。"
+                }
+            case .failure(let error):
+                AppLog.add("扫描", "文件夹选择器失败：\(error.localizedDescription)")
+                importError = error.localizedDescription
             }
+        }
+        .alert("操作失败", isPresented: Binding(
+            get: { importError != nil },
+            set: { if !$0 { importError = nil } }
+        )) {
+            Button("好") { importError = nil }
+        } message: {
+            Text(importError ?? "")
         }
         .alert("扫描完成", isPresented: Binding(
             get: { scanSummary != nil },
@@ -251,6 +290,47 @@ struct LibraryView: View {
         }
         Divider()
         Button(role: .destructive) { store.remove(item) } label: { Label("删除", systemImage: "trash") }
+    }
+}
+
+// MARK: - 空库引导（自绘以保证对比度与按钮层级，深浅色都清晰）
+
+struct EmptyLibraryView: View {
+    let onImport: () -> Void
+    let onScan: () -> Void
+    let onURL: () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "film.stack")
+                .font(.system(size: 44, weight: .light))
+                .foregroundStyle(.secondary)
+            Text("暂无影片")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.primary)
+            Text("导入本地 MKV / MP4 文件，或扫描一个文件夹自动入库。\nMKV 会无损重封装为 MP4 后原生播放杜比视界。")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .lineSpacing(3)
+            VStack(spacing: 10) {
+                Button(action: onImport) {
+                    Text("导入文件").frame(maxWidth: 220)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                Button(action: onScan) {
+                    Text("扫描文件夹").frame(maxWidth: 220)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                Button("添加网址", action: onURL)
+                    .controlSize(.large)
+            }
+            .padding(.top, 6)
+        }
+        .padding(.horizontal, 32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -407,7 +487,7 @@ struct ContinueCard: View {
                 ZStack(alignment: .bottom) {
                     PosterArt(item: item, wide: true)
                     if let p = store.progressMap[item.id] {
-                        ProgressBar(value: p, height: 4)
+                        ProgressBar(value: p, height: 4, onDarkBackground: true)
                     }
                 }
                 if let p = store.progressMap[item.id] {
@@ -426,11 +506,13 @@ struct ContinueCard: View {
 struct ProgressBar: View {
     let value: Double
     var height: CGFloat = 3
+    var onDarkBackground = false
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(.white.opacity(0.18))
-                Capsule().fill(.white).frame(width: geo.size.width * min(1, max(0, value)))
+                Capsule().fill(onDarkBackground ? .white.opacity(0.25) : Color.primary.opacity(0.15))
+                Capsule().fill(onDarkBackground ? .white : Color.accentColor)
+                    .frame(width: geo.size.width * min(1, max(0, value)))
             }
         }
         .frame(height: height)
@@ -478,6 +560,7 @@ struct SearchView: View {
 struct SettingsView: View {
     @EnvironmentObject private var store: LibraryStore
     @Environment(\.dismiss) private var dismiss
+    @AppStorage("appearance.mode") private var appearanceRaw = AppearanceMode.system.rawValue
     @AppStorage("settings.autoResume") private var autoResume = true
     @AppStorage("settings.subFontSize") private var subFontSize: Double = 17
     @State private var cacheNote: String?
@@ -486,6 +569,17 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("外观") {
+                    Picker("外观", selection: $appearanceRaw) {
+                        ForEach(AppearanceMode.allCases, id: \.rawValue) { mode in
+                            Text(mode.label).tag(mode.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Text("播放器界面始终为深色，不受此设置影响。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 Section("播放") {
                     Toggle("自动续播", isOn: $autoResume)
                     Stepper(value: $subFontSize, in: 13...26, step: 1) {
@@ -523,8 +617,14 @@ struct SettingsView: View {
                         Text(cacheNote).font(.footnote).foregroundStyle(.secondary)
                     }
                 }
+                Section("日志") {
+                    NavigationLink("错误日志") { LogView() }
+                    Text("导入、扫描、播放失败都会记在这里。遇到问题把日志复制发给我，就能定位在哪一步断的。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 Section("关于") {
-                    LabeledContent("版本", value: "4.1")
+                    LabeledContent("版本", value: "4.2")
                     Text("本地重封装引擎：MKV 无损转 MP4（dvh1），杜比视界单层原生输出；文本字幕转内嵌字幕轨，图形字幕（PGS/VobSub）暂跳过。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -548,6 +648,44 @@ struct SettingsView: View {
             }
         }
         cacheNote = removed > 0 ? "已清除 \(removed) 个重封装缓存文件。" : "没有可清除的缓存。"
+    }
+}
+
+// MARK: - 错误日志页
+
+struct LogView: View {
+    @State private var lines: [String] = []
+
+    var body: some View {
+        List {
+            if lines.isEmpty {
+                Text("暂无日志")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .navigationTitle("错误日志")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button {
+                        UIPasteboard.general.string = lines.joined(separator: "\n")
+                    } label: { Label("复制全部", systemImage: "doc.on.doc") }
+                    Button(role: .destructive) {
+                        AppLog.clear()
+                        lines = []
+                    } label: { Label("清空日志", systemImage: "trash") }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+            }
+        }
+        .onAppear { lines = AppLog.all() }
     }
 }
 
@@ -586,6 +724,7 @@ struct PlaybackFlow: View {
                 remuxCard
             }
         }
+        .preferredColorScheme(.dark)
         .task { await prepare() }
         .onAppear { store.touchPlayed(item) }
         .onDisappear {
@@ -640,6 +779,7 @@ struct PlaybackFlow: View {
             playURL = url
             return
         }
+        AppLog.add("播放", "\(item.name)：开始重封装 MKV")
         remuxProgress = 0
         let runner = RemuxRunner()
         do {
@@ -649,11 +789,14 @@ struct PlaybackFlow: View {
             remuxProgress = nil
             warnings = result.warnings
             playURL = result.outputURL
+            AppLog.add("播放", "\(item.name)：重封装完成，警告 \(result.warnings.count) 条")
             if !warnings.isEmpty { showWarnings = true }
         } catch let error as RemuxError {
             failure = error.errorDescription ?? "重封装失败。"
+            AppLog.add("播放", "\(item.name)：重封装失败 \(failure ?? "")")
         } catch {
             failure = "重封装失败：\(error.localizedDescription)"
+            AppLog.add("播放", "\(item.name)：\(failure ?? "")")
         }
     }
 }
