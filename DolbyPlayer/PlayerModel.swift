@@ -64,7 +64,7 @@ final class PlayerModel: ObservableObject {
                     self.detectFormat(asset: asset)
                     self.resumeIfNeeded(item: item)
                     if !self.externalCues.isEmpty,
-                       let group = item.asset.mediaSelectionGroup(for: .legible) {
+                       let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) {
                         item.select(nil, in: group) // 有外挂字幕时不叠内封字幕
                     }
                     self.player.play()
@@ -138,7 +138,7 @@ final class PlayerModel: ObservableObject {
         currentSubtitleText = ""
         guard !cues.isEmpty,
               let item = player.currentItem,
-              let group = item.asset.mediaSelectionGroup(for: .legible) else { return }
+              let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) else { return }
         item.select(nil, in: group)
     }
 
