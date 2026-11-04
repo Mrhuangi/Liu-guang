@@ -583,7 +583,7 @@ final class RemuxService {
         return (dts, durations, end)
     }
 
-    static func trackEndMs(_ track: OutputTrack) -> Int64 {
+    fileprivate static func trackEndMs(_ track: OutputTrack) -> Int64 {
         timing(for: track).endMs
     }
 
@@ -602,7 +602,7 @@ final class RemuxService {
         mvhd.appendU16(0x0100)      // volume
         mvhd.appendU16(0)
         mvhd.appendU32(0); mvhd.appendU32(0)
-        for v in [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] { mvhd.appendU32(UInt32(bitPattern: v)) }
+        for v in [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] as [Int32] { mvhd.appendU32(UInt32(bitPattern: v)) }
         for _ in 0..<6 { mvhd.appendU32(0) }
         mvhd.appendU32(UInt32(tracks.count + 1)) // nextTrackID
 
