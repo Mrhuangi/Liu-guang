@@ -634,7 +634,7 @@ final class RemuxService {
         tkhd.appendU16(0) // alternate group
         tkhd.appendU16(track.isVideo || track.isSubtitle ? 0 : 0x0100) // volume
         tkhd.appendU16(0)
-        for v in [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] { tkhd.appendU32(UInt32(bitPattern: v)) }
+        for v in [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] as [Int32] { tkhd.appendU32(UInt32(bitPattern: v)) }
         tkhd.appendU32(track.isVideo ? UInt32(src.pixelWidth) << 16 : 0)
         tkhd.appendU32(track.isVideo ? UInt32(src.pixelHeight) << 16 : 0)
 
