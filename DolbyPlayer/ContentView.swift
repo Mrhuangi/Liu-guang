@@ -13,7 +13,13 @@ struct ContentView: View {
             Tab("媒体库", systemImage: "film.stack") {
                 LibraryView()
             }
-            Tab("搜索", systemImage: "magnifyingglass", role: .search) {
+            Tab("文件源", systemImage: "folder") {
+                SourcesView()
+            }
+            Tab("设置", systemImage: "gearshape") {
+                SettingsView()
+            }
+            Tab("搜索", systemImage: "magnifyingglass") {
                 SearchView()
             }
         }
@@ -61,6 +67,59 @@ enum LibraryDisplay: String, CaseIterable {
     var label: String { self == .grid ? "网格" : "列表" }
 }
 
+// MARK: - 剧集识别（按文件名自动收纳：S01E02 / 第X集）
+
+enum EpisodeParser {
+    struct Info {
+        let show: String
+        let season: Int
+        let episode: Int
+    }
+
+    static func parse(_ name: String) -> Info? {
+        if let m = match(#"[Ss](\d{1,2})[Ee](\d{1,3})"#, in: name),
+           let season = Int(m.1), let episode = Int(m.2) {
+            let show = cleanShow(String(name[..<m.range.lowerBound]))
+            return Info(show: show.isEmpty ? name : show, season: season, episode: episode)
+        }
+        if let m = match(#"第\s*(\d{1,3})\s*集"#, in: name),
+           let episode = Int(m.1) {
+            let show = cleanShow(String(name[..<m.range.lowerBound]))
+            return Info(show: show.isEmpty ? name : show, season: 1, episode: episode)
+        }
+        return nil
+    }
+
+    static func episodeSort(_ a: MediaItem, _ b: MediaItem) -> Bool {
+        let ia = parse(a.name)
+        let ib = parse(b.name)
+        if let ia, let ib {
+            if ia.season != ib.season { return ia.season < ib.season }
+            if ia.episode != ib.episode { return ia.episode < ib.episode }
+        }
+        return a.name.localizedCompare(b.name) == .orderedAscending
+    }
+
+    private static func match(_ pattern: String, in text: String)
+        -> (range: Range<String.Index>, String, String)? {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let full = NSRange(text.startIndex..., in: text)
+        guard let m = regex.firstMatch(in: text, range: full),
+              let r = Range(m.range, in: text) else { return nil }
+        func group(_ index: Int) -> String {
+            guard m.numberOfRanges > index, let gr = Range(m.range(at: index), in: text) else { return "" }
+            return String(text[gr])
+        }
+        return (r, group(1), group(2))
+    }
+
+    private static func cleanShow(_ raw: String) -> String {
+        raw.replacingOccurrences(of: ".", with: " ")
+            .trimmingCharacters(in: CharacterSet(charactersIn: " _-·"))
+            .trimmingCharacters(in: .whitespaces)
+    }
+}
+
 // MARK: - 媒体库
 
 struct LibraryView: View {
@@ -74,9 +133,6 @@ struct LibraryView: View {
     @State private var showFolderImporter = false
     @State private var scanSummary: String?
     @State private var importError: String?
-    @State private var showURLAlert = false
-    @State private var urlText = ""
-    @State private var showSettings = false
     @State private var subtitleTarget: MediaItem?
 
     private var sort: LibrarySort { LibrarySort(rawValue: sortRaw) ?? .recentPlayed }
@@ -104,16 +160,15 @@ struct LibraryView: View {
                 if store.items.isEmpty {
                     EmptyLibraryView(
                         onImport: { showImporter = true },
-                        onScan: { showFolderImporter = true },
-                        onURL: { showURLAlert = true }
+                        onScan: { showFolderImporter = true }
                     )
                 } else if effectiveDisplay == .grid {
-                    gridBody
+                    homeBody
                 } else {
                     listBody
                 }
             }
-            .navigationTitle("流光")
+            .navigationTitle("Lumen")
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
@@ -122,7 +177,6 @@ struct LibraryView: View {
                         if store.scanFolderName != nil {
                             Button { rescan() } label: { Label("重新扫描", systemImage: "arrow.triangle.2.circlepath") }
                         }
-                        Button { showURLAlert = true } label: { Label("添加网址", systemImage: "link.badge.plus") }
                     } label: {
                         Image(systemName: "plus")
                     }
@@ -135,15 +189,12 @@ struct LibraryView: View {
                         Picker("显示", selection: $displayRaw) {
                             ForEach(LibraryDisplay.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
                         }
-                        Divider()
-                        Button { showSettings = true } label: { Label("设置", systemImage: "gearshape") }
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
                 }
             }
         }
-        .sheet(isPresented: $showSettings) { SettingsView() }
         .fileImporter(isPresented: $showImporter,
                       allowedContentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .item],
                       allowsMultipleSelection: true) { result in
@@ -191,15 +242,6 @@ struct LibraryView: View {
             store.scanOwnDocuments()
             store.rescanSavedFolder()
         }
-        .alert("添加网络直链", isPresented: $showURLAlert) {
-            TextField("https://…/movie.mkv", text: $urlText)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-            Button("添加") { store.addURL(urlText); urlText = "" }
-            Button("取消", role: .cancel) { urlText = "" }
-        } message: {
-            Text("支持 http/https 的 MKV、MP4 直链。")
-        }
         .fileImporter(isPresented: Binding(
             get: { subtitleTarget != nil },
             set: { if !$0 { subtitleTarget = nil } }
@@ -214,18 +256,43 @@ struct LibraryView: View {
         }
     }
 
-    private var gridBody: some View {
+    // MARK: 首页分区（继续观看 / 最近添加 / 剧集 / 其他）
+
+    private var seriesGroups: [(show: String, episodes: [MediaItem])] {
+        var dict: [String: [MediaItem]] = [:]
+        for item in store.items {
+            if let info = EpisodeParser.parse(item.name) {
+                dict[info.show, default: []].append(item)
+            }
+        }
+        return dict.filter { $0.value.count >= 2 }
+            .map { (show: $0.key, episodes: $0.value.sorted(by: EpisodeParser.episodeSort)) }
+            .sorted { $0.show.localizedCompare($1.show) == .orderedAscending }
+    }
+
+    private var groupedIDs: Set<UUID> {
+        Set(seriesGroups.flatMap { $0.episodes.map(\.id) })
+    }
+
+    private var standaloneItems: [MediaItem] {
+        sortedItems.filter { !groupedIDs.contains($0.id) }
+    }
+
+    private var recentItems: [MediaItem] {
+        Array(store.items.sorted { $0.addedAt > $1.addedAt }.prefix(10))
+    }
+
+    private var homeBody: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 24) {
+            LazyVStack(alignment: .leading, spacing: 26) {
                 if !store.continueWatching.isEmpty {
                     continueSection
                 }
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 100, maximum: 170), spacing: 12)], spacing: 18) {
-                    ForEach(sortedItems) { item in
-                        MediaCell(item: item) { activeItem = item }
-                            .contextMenu { mediaMenu(item) }
-                    }
+                recentSection
+                if !seriesGroups.isEmpty {
+                    seriesSection
                 }
+                standaloneSection
             }
             .padding(.horizontal, 16)
             .padding(.top, 8)
@@ -233,16 +300,76 @@ struct LibraryView: View {
         }
     }
 
+    private func sectionTitle(_ title: String, count: Int? = nil) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(title)
+                .font(.title3.weight(.bold))
+            Spacer()
+            if let count {
+                Text("\(count)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var continueSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("继续观看")
-                .font(.title3.weight(.semibold))
+            sectionTitle("继续观看")
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
                     ForEach(store.continueWatching) { item in
                         ContinueCard(item: item) { activeItem = item }
                             .contextMenu { mediaMenu(item) }
                     }
+                }
+            }
+        }
+    }
+
+    private var recentSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("最近添加")
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 12) {
+                    ForEach(recentItems) { item in
+                        MediaCell(item: item, showName: true) { activeItem = item }
+                            .frame(width: 110)
+                            .contextMenu { mediaMenu(item) }
+                    }
+                }
+            }
+        }
+    }
+
+    private var seriesSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("剧集")
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 12) {
+                    ForEach(seriesGroups, id: \.show) { group in
+                        NavigationLink {
+                            SeriesView(show: group.show)
+                        } label: {
+                            SeriesCard(show: group.show,
+                                       representative: group.episodes[0],
+                                       count: group.episodes.count)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+
+    private var standaloneSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionTitle(seriesGroups.isEmpty ? "全部影片" : "电影与其他",
+                         count: standaloneItems.count)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 100, maximum: 170), spacing: 12)], spacing: 18) {
+                ForEach(standaloneItems) { item in
+                    MediaCell(item: item, showName: true) { activeItem = item }
+                        .contextMenu { mediaMenu(item) }
                 }
             }
         }
@@ -298,7 +425,6 @@ struct LibraryView: View {
 struct EmptyLibraryView: View {
     let onImport: () -> Void
     let onScan: () -> Void
-    let onURL: () -> Void
 
     var body: some View {
         VStack(spacing: 16) {
@@ -324,8 +450,6 @@ struct EmptyLibraryView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.large)
-                Button("添加网址", action: onURL)
-                    .controlSize(.large)
             }
             .padding(.top, 6)
         }
@@ -415,14 +539,21 @@ extension MediaItem {
 struct MediaCell: View {
     @EnvironmentObject private var store: LibraryStore
     let item: MediaItem
+    var showName = false
     let onPlay: () -> Void
 
     var body: some View {
         Button(action: onPlay) {
             VStack(alignment: .leading, spacing: 6) {
-                PosterArt(item: item)
+                PosterView(item: item)
                 if let p = store.progressMap[item.id] {
                     ProgressBar(value: p)
+                }
+                if showName {
+                    Text(item.name)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
                 }
                 Text(item.captionText)
                     .font(.caption2)
@@ -435,6 +566,84 @@ struct MediaCell: View {
     }
 }
 
+/// 海报：有真实视频帧缩略图时显示缩略图，否则用标题占位图
+struct PosterView: View {
+    @EnvironmentObject private var store: LibraryStore
+    let item: MediaItem
+    var wide = false
+    @State private var thumb: UIImage?
+
+    var body: some View {
+        ZStack {
+            PosterArt(item: item, wide: wide)
+            if let thumb {
+                Image(uiImage: thumb)
+                    .resizable()
+                    .scaledToFill()
+            }
+        }
+        .aspectRatio(wide ? 16.0 / 9.0 : 2.0 / 3.0, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .task(id: item.id) {
+            if let cached = ThumbnailStore.cached(for: item) {
+                thumb = cached
+            } else {
+                thumb = await ThumbnailStore.generate(for: item, store: store)
+            }
+        }
+    }
+}
+
+/// 剧集卡（首页「剧集」分区）
+struct SeriesCard: View {
+    let show: String
+    let representative: MediaItem
+    let count: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            PosterView(item: representative)
+            Text(show)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            Text("共 \(count) 集")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(width: 110)
+    }
+}
+
+/// 剧集详情页：一部剧的全部集数，按季/集排序
+struct SeriesView: View {
+    @EnvironmentObject private var store: LibraryStore
+    let show: String
+    @State private var activeItem: MediaItem?
+
+    private var episodes: [MediaItem] {
+        store.items
+            .filter { EpisodeParser.parse($0.name)?.show == show }
+            .sorted(by: EpisodeParser.episodeSort)
+    }
+
+    var body: some View {
+        List(episodes) { item in
+            MediaRow(item: item) { activeItem = item }
+                .contextMenu {
+                    Button { activeItem = item } label: { Label("播放", systemImage: "play.fill") }
+                    Button(role: .destructive) { store.remove(item) } label: { Label("删除", systemImage: "trash") }
+                }
+        }
+        .listStyle(.plain)
+        .navigationTitle(show)
+        .navigationBarTitleDisplayMode(.inline)
+        .fullScreenCover(item: $activeItem) { item in
+            PlaybackFlow(item: item, store: store)
+        }
+    }
+}
+
 struct MediaRow: View {
     let item: MediaItem
     let onPlay: () -> Void
@@ -442,7 +651,7 @@ struct MediaRow: View {
     var body: some View {
         Button(action: onPlay) {
             HStack(spacing: 12) {
-                PosterArt(item: item)
+                PosterView(item: item)
                     .frame(width: 44)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(item.name)
@@ -485,7 +694,7 @@ struct ContinueCard: View {
         Button(action: onPlay) {
             VStack(alignment: .leading, spacing: 6) {
                 ZStack(alignment: .bottom) {
-                    PosterArt(item: item, wide: true)
+                    PosterView(item: item, wide: true)
                     if let p = store.progressMap[item.id] {
                         ProgressBar(value: p, height: 4, onDarkBackground: true)
                     }
@@ -555,6 +764,107 @@ struct SearchView: View {
     }
 }
 
+// MARK: - 文件源（本地来源管理：扫描文件夹 / 导入）
+
+struct SourcesView: View {
+    @EnvironmentObject private var store: LibraryStore
+    @State private var showImporter = false
+    @State private var showFolderImporter = false
+    @State private var summary: String?
+    @State private var importError: String?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("扫描文件夹") {
+                    LabeledContent("当前文件夹", value: store.scanFolderName ?? "未设置")
+                    Button {
+                        showFolderImporter = true
+                    } label: {
+                        Label(store.scanFolderName == nil ? "选择文件夹" : "更换文件夹",
+                              systemImage: "folder.badge.plus")
+                    }
+                    if store.scanFolderName != nil {
+                        Button {
+                            rescan()
+                        } label: {
+                            Label("重新扫描", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        Button("清除扫描文件夹", role: .destructive) {
+                            store.clearScanFolder()
+                        }
+                    }
+                    Text("选一次文件夹，之后每次打开 App 都会自动把里面的新视频加入媒体库。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Section("导入文件") {
+                    Button {
+                        showImporter = true
+                    } label: {
+                        Label("从「文件」导入", systemImage: "doc.badge.plus")
+                    }
+                    Text("也可以把视频拷进「文件」App 里 Lumen 的文件夹，下次打开 App 时会自动入库。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Section("媒体库") {
+                    LabeledContent("视频总数", value: "\(store.items.count)")
+                }
+            }
+            .navigationTitle("文件源")
+        }
+        .fileImporter(isPresented: $showImporter,
+                      allowedContentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .item],
+                      allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls):
+                AppLog.add("导入", "文件选择器返回 \(urls.count) 个文件")
+                urls.forEach(store.addFile)
+            case .failure(let error):
+                AppLog.add("导入", "文件选择器失败：\(error.localizedDescription)")
+                importError = error.localizedDescription
+            }
+        }
+        .fileImporter(isPresented: $showFolderImporter,
+                      allowedContentTypes: [.folder],
+                      allowsMultipleSelection: false) { result in
+            switch result {
+            case .success(let urls):
+                if let folder = urls.first {
+                    let r = store.setScanFolder(url: folder)
+                    summary = "在「\(folder.lastPathComponent)」里共找到 \(r.found) 个视频，新加入媒体库 \(r.added) 个。"
+                }
+            case .failure(let error):
+                AppLog.add("扫描", "文件夹选择器失败：\(error.localizedDescription)")
+                importError = error.localizedDescription
+            }
+        }
+        .alert("扫描完成", isPresented: Binding(
+            get: { summary != nil },
+            set: { if !$0 { summary = nil } }
+        )) {
+            Button("好") { summary = nil }
+        } message: {
+            Text(summary ?? "")
+        }
+        .alert("操作失败", isPresented: Binding(
+            get: { importError != nil },
+            set: { if !$0 { importError = nil } }
+        )) {
+            Button("好") { importError = nil }
+        } message: {
+            Text(importError ?? "")
+        }
+    }
+
+    private func rescan() {
+        if let r = store.rescanSavedFolder(), let name = store.scanFolderName {
+            summary = "重新扫描「\(name)」完成：共 \(r.found) 个视频，新加入 \(r.added) 个。"
+        }
+    }
+}
+
 // MARK: - 设置
 
 struct SettingsView: View {
@@ -562,6 +872,9 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("appearance.mode") private var appearanceRaw = AppearanceMode.system.rawValue
     @AppStorage("settings.autoResume") private var autoResume = true
+    @AppStorage("settings.autoNext") private var autoNext = true
+    @AppStorage("settings.autoPiP") private var autoPiP = true
+    @AppStorage("settings.rememberRate") private var rememberRate = true
     @AppStorage("settings.subFontSize") private var subFontSize: Double = 17
     @State private var cacheNote: String?
     @State private var scanNote: String?
@@ -582,6 +895,9 @@ struct SettingsView: View {
                 }
                 Section("播放") {
                     Toggle("自动续播", isOn: $autoResume)
+                    Toggle("自动连播下一集", isOn: $autoNext)
+                    Toggle("退出时自动画中画", isOn: $autoPiP)
+                    Toggle("记住播放速度", isOn: $rememberRate)
                     Stepper(value: $subFontSize, in: 13...26, step: 1) {
                         LabeledContent("外挂字幕字号", value: "\(Int(subFontSize))")
                     }
@@ -624,18 +940,13 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 Section("关于") {
-                    LabeledContent("版本", value: "4.2")
+                    LabeledContent("版本", value: "4.4")
                     Text("本地重封装引擎：MKV 无损转 MP4（dvh1），杜比视界单层原生输出；文本字幕转内嵌字幕轨，图形字幕（PGS/VobSub）暂跳过。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
             .navigationTitle("设置")
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") { dismiss() }
-                }
-            }
         }
     }
 
@@ -697,20 +1008,28 @@ struct PlaybackFlow: View {
     @StateObject private var model = PlayerModel()
     @Environment(\.dismiss) private var dismiss
 
+    @State private var currentItem: MediaItem
     @State private var playURL: URL?
     @State private var remuxProgress: Double?
     @State private var failure: String?
     @State private var warnings: [String] = []
     @State private var showWarnings = false
 
+    init(item: MediaItem, store: LibraryStore) {
+        self.item = item
+        self.store = store
+        _currentItem = State(initialValue: item)
+    }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             if let playURL {
-                PlayerScreen(url: playURL, title: item.name,
-                             subtitleCues: store.loadExternalSubtitleCues(for: item),
-                             resumeKey: item.id.uuidString,
+                PlayerScreen(url: playURL, title: currentItem.name,
+                             subtitleCues: store.loadExternalSubtitleCues(for: currentItem),
+                             resumeKey: currentItem.id.uuidString,
                              model: model) { dismiss() }
+                    .id(playURL)
             } else if let failure {
                 ContentUnavailableView {
                     Label("无法播放", systemImage: "exclamationmark.triangle")
@@ -726,11 +1045,16 @@ struct PlaybackFlow: View {
         }
         .preferredColorScheme(.dark)
         .task { await prepare() }
-        .onAppear { store.touchPlayed(item) }
+        .onAppear {
+            store.touchPlayed(currentItem)
+            model.onPlaybackEnded = { advanceToNext() }
+            OrientationHelper.unlockForPlayback()
+        }
         .onDisappear {
             model.stop()
             store.stopAccessing()
             store.refreshProgress()
+            OrientationHelper.lockToPortrait()
         }
         .alert("重封装提示", isPresented: $showWarnings) {
             Button("继续播放") { }
@@ -739,10 +1063,25 @@ struct PlaybackFlow: View {
         }
     }
 
+    /// 自动连播：当前集播完后切到同剧的下一集（设置里可关）
+    private func advanceToNext() {
+        guard UserDefaults.standard.object(forKey: "settings.autoNext") as? Bool != false else { return }
+        guard let next = store.nextInSeries(after: currentItem) else { return }
+        AppLog.add("播放", "自动连播下一集：\(next.name)")
+        model.stop()
+        currentItem = next
+        playURL = nil
+        remuxProgress = nil
+        failure = nil
+        warnings = []
+        store.touchPlayed(next)
+        Task { await prepare() }
+    }
+
     private var remuxCard: some View {
         VStack(spacing: 14) {
             LiuGuangGlyph()
-            Text(item.name)
+            Text(currentItem.name)
                 .font(.headline)
                 .foregroundStyle(.white)
                 .lineLimit(2)
@@ -770,7 +1109,7 @@ struct PlaybackFlow: View {
     }
 
     private func prepare() async {
-        guard let url = store.resolveURL(for: item) else {
+        guard let url = store.resolveURL(for: currentItem) else {
             failure = "无法读取这个文件（书签失效或链接不可用），请删除后重新导入。"
             return
         }
@@ -779,7 +1118,7 @@ struct PlaybackFlow: View {
             playURL = url
             return
         }
-        AppLog.add("播放", "\(item.name)：开始重封装 MKV")
+        AppLog.add("播放", "\(currentItem.name)：开始重封装 MKV")
         remuxProgress = 0
         let runner = RemuxRunner()
         do {
@@ -789,14 +1128,14 @@ struct PlaybackFlow: View {
             remuxProgress = nil
             warnings = result.warnings
             playURL = result.outputURL
-            AppLog.add("播放", "\(item.name)：重封装完成，警告 \(result.warnings.count) 条")
+            AppLog.add("播放", "\(currentItem.name)：重封装完成，警告 \(result.warnings.count) 条")
             if !warnings.isEmpty { showWarnings = true }
         } catch let error as RemuxError {
             failure = error.errorDescription ?? "重封装失败。"
-            AppLog.add("播放", "\(item.name)：重封装失败 \(failure ?? "")")
+            AppLog.add("播放", "\(currentItem.name)：重封装失败 \(failure ?? "")")
         } catch {
             failure = "重封装失败：\(error.localizedDescription)"
-            AppLog.add("播放", "\(item.name)：\(failure ?? "")")
+            AppLog.add("播放", "\(currentItem.name)：\(failure ?? "")")
         }
     }
 }
@@ -828,33 +1167,17 @@ struct PlayerScreen: View {
     let onClose: () -> Void
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
+        ZStack(alignment: .topTrailing) {
             PlayerView(player: model.player, subtitleText: model.currentSubtitleText)
                 .ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(model.title)
-                            .font(.headline)
-                            .foregroundStyle(.white)
-                            .shadow(radius: 4)
-                        if !model.formatBadge.isEmpty {
-                            Text(model.formatBadge)
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 3)
-                                .background(.ultraThinMaterial, in: Capsule())
-                        }
-                    }
-                    Spacer()
-                    Button(action: onClose) {
-                        Image(systemName: "xmark")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.white)
-                            .frame(width: 32, height: 32)
-                            .background(.ultraThinMaterial, in: Circle())
-                    }
+            // 只保留一个关闭按钮：标题/徽章不再自绘，避免和系统播放器自带的标题层重叠
+            VStack(alignment: .trailing, spacing: 10) {
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 32, height: 32)
+                        .background(.ultraThinMaterial, in: Circle())
                 }
                 if let error = model.errorMessage {
                     Text(error)
@@ -863,9 +1186,14 @@ struct PlayerScreen: View {
                         .padding(10)
                         .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
                 }
-                Spacer()
             }
             .padding()
+        }
+        .onChange(of: model.videoIsLandscape) { _, isLandscape in
+            // 横屏视频自动转横屏全屏
+            if isLandscape == true {
+                OrientationHelper.requestLandscape()
+            }
         }
         .task {
             model.load(url: url, title: title, resumeKey: resumeKey)
