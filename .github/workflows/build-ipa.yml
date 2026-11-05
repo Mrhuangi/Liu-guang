@@ -1,60 +1,18 @@
-name: Build unsigned IPA
-
-# 在 GitHub 的 macOS 云主机上把「Lumen」编译成未签名 IPA，
-# 产物挂到 Release 供下载，再用手机上的签名工具（全能签 / ESign / Feather 等）+ 证书签名安装。
+name: probe
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
+    branches: [main]
 jobs:
-  build:
-    runs-on: xcode-27
+  probe:
+    runs-on: macos-26
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Generate app icon
+      - name: Xcode inventory
         run: |
-          pip3 install --break-system-packages --quiet pillow
-          python3 tools/make_icons_ci.py
-
-      - name: Build (no code signing)
-        run: |
-          xcodebuild \
-            -project DolbyPlayer.xcodeproj \
-            -scheme DolbyPlayer \
-            -configuration Release \
-            -sdk iphoneos \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
-            build
-
-      - name: Package IPA
-        run: |
-          APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
-          echo "App bundle: $APP_PATH"
-          mkdir -p Payload
-          cp -R "$APP_PATH" Payload/
-          zip -r Lumen-unsigned.ipa Payload
-
-      - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Lumen-unsigned-ipa
-          path: Lumen-unsigned.ipa
-          if-no-files-found: error
-
-      - name: Publish IPA to Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: Lumen 未签名 IPA · build-${{ github.run_number }}
-          files: Lumen-unsigned.ipa
-          fail_on_unmatched_files: true
+          ls /Applications | grep -i xcode || true
+          for app in /Applications/Xcode*.app; do
+            echo "=== $app ==="
+            DEVELOPER_DIR="$app/Contents/Developer" xcodebuild -version || true
+            DEVELOPER_DIR="$app/Contents/Developer" xcodebuild -showsdks || true
+          done
+          xcodebuild -version
+          xcodebuild -showsdks
